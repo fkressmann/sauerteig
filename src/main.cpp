@@ -16,11 +16,12 @@ String inputMessage = "24.0";
 String lastTemperature;
 String enableArmChecked = "checked";
 String inputMessage2 = "true";
-float temp_is = 0;
 
 struct {
-  float threshold_lower = 23;
-  float threshold_upper = 25;
+  float temp_set = 24;
+  int kp = 90;
+  int ki = 30;
+  int kd = 80;
   bool active = true;
 } data;
 
@@ -36,8 +37,10 @@ const char index_html[] PROGMEM = R"rawliteral(
   <h3>%ACTIVE%</h3>
   <h2>Einstellungen</h2>
   <form action="/get">
-    Einschalten ab <input type="number" step="0.1" name="threshold_input_lower" value="%THRESHOLD_LOWER%" required><br>
-    Ausschalten ab <input type="number" step="0.1" name="threshold_input_upper" value="%THRESHOLD_UPPER%" required><br>
+    Temperatur Soll <input type="number" step="0.1" name="set_point" value="%set_point%" required><br>
+    Kp <input type="number" step="1" name="kp" value="%kp%" required> P: %p%<br>
+    Ki <input type="number" step="1" name="ki" value="%ki%" required> I: %i%<br>
+    Kd <input type="number" step="1" name="kd" value="%kd%" required> D: %d%<br>
     Aktiv? <input type="checkbox" name="enable_arm_input" value="true" %ENABLE_ARM_INPUT%><br><br>
     <input type="submit" value="Speichern">
   </form>
@@ -46,16 +49,27 @@ const char index_html[] PROGMEM = R"rawliteral(
 // Flag variable to keep track if triggers was activated or not
 bool output = false;
 
-const char* THRESHOLD_LOWER = "threshold_input_lower";
-const char* THRESHOLD_UPPER = "threshold_input_upper";
+const char* SET_POINT = "set_point";
+const char* KP = "kp";
+const char* KI = "ki";
+const char* KD = "kd";
 const char* ACTIVE = "enable_arm_input";
 
-// Interval between sensor readings. Learn more about ESP32 timers: https://RandomNerdTutorials.com/esp32-pir-motion-sensor-interrupts-timers/
-unsigned long previousMillis = 0;     
-const long interval = 5000;    
+float temperature_read = 0.0;
+float PID_error = 0;
+float previous_error = 0;
+float elapsedTime, currentTime, timePrev;
+float PID_value = 0;
+int button_pressed = 0;
+int menu_activated=0;
+float last_set_temperature = 0;
+
+float PID_p = 0;    float PID_i = 0;    float PID_d = 0;
+float last_kp = 0;  float last_ki = 0;  float last_kd = 0;
+  
 
 // GPIO where the output is connected to
-const int out_pin = D1;
+const int out_pin = D5;
 const int LED = D4;
 // GPIO where the DS18B20 is connected to
 const int oneWireBus = D3;     
@@ -73,32 +87,47 @@ AsyncWebServer server(80);
 // Replaces placeholder with DS18B20 values
 String processor(const String& var){
   //Serial.println(var);
-  if(var == "TEMPERATURE"){
-    return String(temp_is);
+  if(var == "TEMPERATURE") {
+    return String(temperature_read);
   }
-  else if(var == "THRESHOLD_LOWER"){
-    return String(data.threshold_lower);
+  else if(var == SET_POINT){
+    return String(data.temp_set);
   }
-  else if(var == "THRESHOLD_UPPER"){
-    return String(data.threshold_upper);
+  else if(var == KP){
+    return String(data.kp);
   }
-  else if(var == "ACTIVE"){
-    return output ? "Heizung an" : "Heizung aus";
+  else if(var == KI){
+    return String(data.ki);
   }
-  else if(var == "ENABLE_ARM_INPUT"){
+  else if(var == KD){
+    return String(data.kd);
+  }
+  else if(var == "p"){
+    return String(PID_p);
+  }
+  else if(var == "i"){
+    return String(PID_i);
+  }
+  else if(var == "d"){
+    return String(PID_d);
+  }
+  else if(var == "ENABLE_ARM_INPUT") {
     return data.active ? "checked" : "";
   }
   return String();
 }
 
 void print_data() {
-  Serial.println("lower: " + String(data.threshold_lower));
-  Serial.println("upper: " + String(data.threshold_upper));
+  Serial.println("setpoint: " + String(data.temp_set));
+  Serial.println("kp: " + String(data.kp));
+  Serial.println("ki: " + String(data.ki));
+  Serial.println("kd: " + String(data.kd));
   Serial.println("active?: " + String(data.active));
 }
 
 void setup() {
   Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
   WiFi.hostname("sauerteig");
   wifiMulti.addAP(STA_SSID_1, STA_PSK_1);
   wifiMulti.addAP(STA_SSID_2, STA_PSK_2);
@@ -119,7 +148,6 @@ void setup() {
   
   pinMode(out_pin, OUTPUT);
   pinMode(oneWireBus, INPUT_PULLUP);
-  pinMode(LED, OUTPUT);
   digitalWrite(out_pin, LOW);
   
   // Start the DS18B20 sensor
@@ -133,9 +161,11 @@ void setup() {
   // Receive an HTTP GET request at <ESP_IP>/get?threshold_input=<inputMessage>&enable_arm_input=<inputMessage2>
   server.on("/get", HTTP_GET, [] (AsyncWebServerRequest *request) {
     // GET threshold_input value on <ESP_IP>/get?threshold_input=<inputMessage>
-    if (request->hasParam(THRESHOLD_LOWER)) {
-      data.threshold_lower = request->getParam(THRESHOLD_LOWER)->value().toFloat();
-      data.threshold_upper = request->getParam(THRESHOLD_UPPER)->value().toFloat();
+    if (request->hasParam(SET_POINT)) {
+      data.temp_set = request->getParam(SET_POINT)->value().toFloat();
+      data.kp = request->getParam(KP)->value().toInt();
+      data.ki = request->getParam(KI)->value().toInt();
+      data.kd = request->getParam(KD)->value().toInt();
       // GET enable_arm_input value on <ESP_IP>/get?enable_arm_input=<inputMessage2>
       if (request->hasParam(ACTIVE)) {
         data.active = true;
@@ -156,39 +186,41 @@ void setup() {
   });
   server.onNotFound(notFound);
   server.begin();
+  analogWriteFreq(100);
+  currentTime = millis();
 }
 
 void loop() {
-  unsigned long currentMillis = millis();
+  wifiMulti.run();
   sensors.requestTemperatures();
-  temp_is = sensors.getTempCByIndex(0);
-  if (currentMillis - previousMillis >= interval) {
-    previousMillis = currentMillis;
-    if ( temp_is < -100 ) {
-      Serial.println("No sensor connected, skipping");
-      digitalWrite(out_pin, LOW);
-      output = false;
-      return;
-    }
-    Serial.print(temp_is);
-    Serial.println(" *C");
-    
-    // Check if temperature is above threshold and if it needs to trigger output
-    if(temp_is > data.threshold_upper && data.active && output){
-      String message = "Temperature above threshold. Current temperature: " + 
-                            String(temp_is) + "C";
-      Serial.println(message);
-      output = false;
-      digitalWrite(out_pin, LOW);
-    }
-    // Check if temperature is below threshold and if it needs to trigger output
-    else if(temp_is < data.threshold_lower && data.active && !output) {
-      String message = "Temperature below threshold. Current temperature: " + 
-                            String(temp_is) + " C";
-      Serial.println(message);
-      output = true;
-      digitalWrite(out_pin, HIGH);
-    }
-    digitalWrite(LED, !digitalRead(LED));
-  }
+  temperature_read = sensors.getTempCByIndex(0);
+  if (temperature_read < 0) return;
+  Serial.println("temp " + String(temperature_read));
+  // calculate the error between the setpoint and the real value
+  PID_error = data.temp_set - temperature_read;
+  //Calculate the P value
+  PID_p = data.kp * PID_error;
+  Serial.println("P " + String(PID_p));
+
+  // Calculate the I value
+  PID_i = PID_i + (0.01 * data.ki * PID_error);
+  Serial.println("I " + String(PID_i));
+
+  // For derivative we need real time to calculate speed change rate
+  timePrev = currentTime;                            // save previously used currentTime to prevTime
+  currentTime = millis();                            // actual time read
+  elapsedTime = (currentTime - timePrev) / 1000; 
+  // Calculate D value
+  PID_d = data.kd *((PID_error - previous_error)/elapsedTime);
+  Serial.println("D " + String(PID_d));
+  // Final total PID value is the sum of P + I + D
+  PID_value = PID_p + PID_i + PID_d;
+  Serial.println(PID_value);
+  // Limit range of PWM to Arduino nano 10bit PWM
+  if(PID_value < 0)
+  {    PID_value = 0;    }
+  if(PID_value > 1023)  
+  {    PID_value = 1023;  }
+  analogWrite(out_pin,PID_value);
+  previous_error = PID_error;     //Remember to store the previous error for next loop.
 }
